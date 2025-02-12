@@ -1,20 +1,34 @@
 """the downloader module handles the downloading"""
 
-from multiprocessing.pool import ThreadPool
-from threading import Semaphore
-import urllib.request
-import io
-import math
-import exifread
-import json
-import time
 import hashlib
-import pyarrow as pa
+import io
+import json
+import logging
+import math
+import os
+import time
 import traceback
+import urllib.request
+from multiprocessing.pool import ThreadPool
+from pathlib import Path
+from threading import Semaphore
+from typing import Any
 
+import cv2
+import exifread
 import fsspec
-from .logger import CappedCounter
-from .logger import write_stats
+import numpy as np
+import pyarrow as pa
+from sympy import print_gtk
+
+from src.data.data_filter.script_create_nriqa_metrics_csv import (
+    IMAGE_ID_KEY,
+    compute_metrics,
+    load_existing_results,
+    write_rows,
+)
+
+from .logger import CappedCounter, write_stats
 
 
 def is_disallowed(headers, user_agent_token, disallowed_header_directives):
@@ -38,9 +52,13 @@ def download_image(row, timeout, user_agent_token, disallowed_header_directives)
     """Download an image with urllib"""
     key, url = row
     img_stream = None
-    user_agent_string = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:72.0) Gecko/20100101 Firefox/72.0"
+    user_agent_string = (
+        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:72.0) Gecko/20100101 Firefox/72.0"
+    )
     if user_agent_token:
-        user_agent_string += f" (compatible; {user_agent_token}; +https://github.com/rom1504/img2dataset)"
+        user_agent_string += (
+            f" (compatible; {user_agent_token}; +https://github.com/rom1504/img2dataset)"
+        )
     try:
         request = urllib.request.Request(url, data=None, headers={"User-Agent": user_agent_string})
         with urllib.request.urlopen(request, timeout=timeout) as r:
@@ -58,9 +76,43 @@ def download_image(row, timeout, user_agent_token, disallowed_header_directives)
         return key, None, str(err)
 
 
-def download_image_with_retry(row, timeout, retries, user_agent_token, disallowed_header_directives):
+def download_image_with_retry(
+    row,
+    timeout,
+    retries,
+    user_agent_token,
+    disallowed_header_directives,
+    processed_image_names: set[str],
+    csv_path: Path,
+):
     for _ in range(retries + 1):
-        key, img_stream, err = download_image(row, timeout, user_agent_token, disallowed_header_directives)
+        key, _ = row
+        if key in processed_image_names:
+            logging.info(f"Skipping {key}, already in CSV.")
+            return
+
+        key, img_stream, err = download_image(
+            row, timeout, user_agent_token, disallowed_header_directives
+        )
+        if img_stream is not None:
+            csv_row = {IMAGE_ID_KEY: key}
+            img_stream.seek(0)
+            img_buf = np.frombuffer(img_stream.read(), np.uint8)
+            image_npy = cv2.imdecode(img_buf, cv2.IMREAD_COLOR)
+            if image_npy is None or image_npy.size < 10 * 10 * 3:
+                logging.info(f"Image {key} is None or too small, skipping.")
+                write_rows(csv_path=csv_path, rows=[csv_row])
+                return
+
+            metrics = compute_metrics(image_npy, 1)
+            csv_row.update(metrics)
+
+            if False:
+                logging.info("Not saving image: %s", key)
+                write_rows(csv_path=csv_path, rows=[csv_row])
+                return
+            write_rows(csv_path=csv_path, rows=[csv_row])
+
         if img_stream is not None:
             return key, img_stream, err
     return key, None, err
@@ -112,13 +164,20 @@ class Downloader:
         self.verify_hash_type = verify_hash_type
         self.encode_format = encode_format
         self.retries = retries
-        self.user_agent_token = None if user_agent_token is None else user_agent_token.strip().lower()
+        self.user_agent_token = (
+            None if user_agent_token is None else user_agent_token.strip().lower()
+        )
         self.disallowed_header_directives = (
             None
             if disallowed_header_directives is None
             else {directive.strip().lower() for directive in disallowed_header_directives}
         )
         self.blurring_bbox_col = blurring_bbox_col
+
+        # OUR ADJUSTMENT
+        self.csv_path = Path("test.csv")
+        existing_results = load_existing_results(self.csv_path)
+        self.processed_image_names = set(existing_results.keys()) if existing_results else set()
 
     def __call__(
         self,
@@ -172,11 +231,19 @@ class Downloader:
         failed_to_download = 0
         failed_to_resize = 0
         url_indice = self.column_list.index("url")
-        caption_indice = self.column_list.index("caption") if "caption" in self.column_list else None
-        hash_indice = (
-            self.column_list.index(self.verify_hash_type) if self.verify_hash_type in self.column_list else None
+        caption_indice = (
+            self.column_list.index("caption") if "caption" in self.column_list else None
         )
-        bbox_indice = self.column_list.index(self.blurring_bbox_col) if self.blurring_bbox_col is not None else None
+        hash_indice = (
+            self.column_list.index(self.verify_hash_type)
+            if self.verify_hash_type in self.column_list
+            else None
+        )
+        bbox_indice = (
+            self.column_list.index(self.blurring_bbox_col)
+            if self.blurring_bbox_col is not None
+            else None
+        )
         key_url_list = [(key, x[url_indice]) for key, x in shard_to_dl]
 
         # this prevents an accumulation of more than twice the number of threads in sample ready to resize
@@ -200,17 +267,23 @@ class Downloader:
             self.encode_format,
         )
         oom_sample_per_shard = math.ceil(math.log10(self.number_sample_per_shard))
+
         with ThreadPool(self.thread_count) as thread_pool:
-            for key, img_stream, error_message in thread_pool.imap_unordered(
+            for tup in thread_pool.imap_unordered(
                 lambda x: download_image_with_retry(
                     x,
                     timeout=self.timeout,
                     retries=self.retries,
                     user_agent_token=self.user_agent_token,
                     disallowed_header_directives=self.disallowed_header_directives,
+                    processed_image_names=self.processed_image_names,
+                    csv_path=self.csv_path,
                 ),
                 loader,
             ):
+                if not tup:
+                    continue
+                key, img_stream, error_message = tup
                 try:
                     _, sample_data = shard_to_dl[key]
                     str_key = compute_key(key, shard_id, oom_sample_per_shard, self.oom_shard_count)
@@ -251,7 +324,9 @@ class Downloader:
 
                     if hash_indice is not None:
                         img_stream.seek(0)
-                        test_hash = getattr(hashlib, self.verify_hash_type)(img_stream.read()).hexdigest()
+                        test_hash = getattr(hashlib, self.verify_hash_type)(
+                            img_stream.read()
+                        ).hexdigest()
                         if test_hash != sample_data[hash_indice]:
                             failed_to_download += 1
                             status = "failed_to_download"
@@ -305,7 +380,9 @@ class Downloader:
                             exif = json.dumps(
                                 {
                                     k: str(v).strip()
-                                    for k, v in exifread.process_file(img_stream, details=False).items()
+                                    for k, v in exifread.process_file(
+                                        img_stream, details=False
+                                    ).items()
                                     if v is not None
                                 }
                             )
@@ -315,7 +392,9 @@ class Downloader:
 
                     if self.compute_hash is not None:
                         img_stream.seek(0)
-                        meta[self.compute_hash] = getattr(hashlib, self.compute_hash)(img_stream.read()).hexdigest()
+                        meta[self.compute_hash] = getattr(hashlib, self.compute_hash)(
+                            img_stream.read()
+                        ).hexdigest()
 
                     meta["status"] = status
                     meta["width"] = width
@@ -324,7 +403,6 @@ class Downloader:
                     meta["original_height"] = original_height
                     img_stream.close()
                     del img_stream
-
                     sample_writer.write(
                         img,
                         str_key,

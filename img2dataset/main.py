@@ -1,29 +1,31 @@
 """Img2dataset"""
 
-from typing import List, Optional
-import fire
 import logging
-from .logger import LoggerProcess
-from .resizer import Resizer
+import os
+import signal
+import sys
+from typing import List, Optional
+
+import fire
+import fsspec
+
 from .blurrer import BoundingBoxBlurrer
-from .writer import (
-    WebDatasetSampleWriter,
-    FilesSampleWriter,
-    ParquetSampleWriter,
-    TFRecordSampleWriter,
-    DummySampleWriter,
-)
-from .reader import Reader
-from .downloader import Downloader
 from .distributor import (
     multiprocessing_distributor,
     pyspark_distributor,
     ray_distributor,
 )
-import fsspec
-import sys
-import signal
-import os
+from .downloader import Downloader
+from .logger import LoggerProcess
+from .reader import Reader
+from .resizer import Resizer
+from .writer import (
+    DummySampleWriter,
+    FilesSampleWriter,
+    ParquetSampleWriter,
+    TFRecordSampleWriter,
+    WebDatasetSampleWriter,
+)
 
 logging.getLogger("exifread").setLevel(level=logging.CRITICAL)
 
@@ -154,13 +156,17 @@ def download(
         done_shards = set()
     else:
         if incremental_mode == "incremental":
-            done_shards = set(int(x.split("/")[-1].split("_")[0]) for x in fs.glob(output_path + "/*.json"))
+            done_shards = set(
+                int(x.split("/")[-1].split("_")[0]) for x in fs.glob(output_path + "/*.json")
+            )
         elif incremental_mode == "overwrite":
             fs.rm(output_path, recursive=True)
             fs.mkdir(output_path)
             done_shards = set()
         elif incremental_mode == "extend":
-            existing_shards = [int(x.split("/")[-1].split("_")[0]) for x in fs.glob(output_path + "/*.json")]
+            existing_shards = [
+                int(x.split("/")[-1].split("_")[0]) for x in fs.glob(output_path + "/*.json")
+            ]
             start_shard_id = max(existing_shards, default=-1) + 1
             done_shards = set()
         else:
@@ -207,7 +213,6 @@ def download(
         sample_writer_class = DummySampleWriter  # type: ignore
     else:
         raise ValueError(f"Invalid output format {output_format}")
-
     if bbox_col is not None:
         blurrer = BoundingBoxBlurrer()
     else:

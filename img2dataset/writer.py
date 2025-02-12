@@ -1,13 +1,26 @@
-""""writer module handle writing the images to disk"""
+""" "writer module handle writing the images to disk"""
 
 import json
+import logging
 import os
+from pathlib import Path
+from typing import Any
 
+import cv2
 import fsspec
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import webdataset as wds
+
+from src.data.data_filter.script_create_nriqa_metrics_csv import (
+    IMAGE_ID_KEY,
+    compute_metrics,
+    load_existing_results,
+    write_rows,
+)
+
+logging.getLogger("exifread").setLevel(level=logging.DEBUG)
 
 
 class BufferedParquetWriter:
@@ -112,7 +125,9 @@ class WebDatasetSampleWriter:
         self.tar_fd = fs.open(f"{output_path}/{shard_name}.tar", "wb")
         self.tarwriter = wds.TarWriter(self.tar_fd)
         self.save_caption = save_caption
-        self.buffered_parquet_writer = BufferedParquetWriter(output_folder + "/" + shard_name + ".parquet", schema, 100)
+        self.buffered_parquet_writer = BufferedParquetWriter(
+            output_folder + "/" + shard_name + ".parquet", schema, 100
+        )
         self.encode_format = encode_format
 
     def write(self, img_str, key, caption, meta):
@@ -150,7 +165,9 @@ class TFRecordSampleWriter:
         try:
             os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
             import tensorflow_io as _  # pylint: disable=import-outside-toplevel
-            from tensorflow.python.lib.io.tf_record import TFRecordWriter  # pylint: disable=import-outside-toplevel
+            from tensorflow.python.lib.io.tf_record import (
+                TFRecordWriter,  # pylint: disable=import-outside-toplevel
+            )
             from tensorflow.python.training.training import (  # pylint: disable=import-outside-toplevel
                 BytesList,
                 Example,
@@ -179,7 +196,9 @@ class TFRecordSampleWriter:
         self.shard_id = shard_id
         self.tf_writer = TFRecordWriter(f"{output_folder}/{shard_name}.tfrecord")
         self.save_caption = save_caption
-        self.buffered_parquet_writer = BufferedParquetWriter(output_folder + "/" + shard_name + ".parquet", schema, 100)
+        self.buffered_parquet_writer = BufferedParquetWriter(
+            output_folder + "/" + shard_name + ".parquet", schema, 100
+        )
         self.encode_format = encode_format
 
     def write(self, img_str, key, caption, meta):
@@ -264,7 +283,9 @@ class FilesSampleWriter:
         if not self.fs.exists(self.subfolder):
             self.fs.mkdir(self.subfolder)
         self.save_caption = save_caption
-        self.buffered_parquet_writer = BufferedParquetWriter(output_folder + "/" + shard_name + ".parquet", schema, 100)
+        self.buffered_parquet_writer = BufferedParquetWriter(
+            output_folder + "/" + shard_name + ".parquet", schema, 100
+        )
         self.encode_format = encode_format
 
     def write(self, img_str, key, caption, meta):
@@ -296,7 +317,9 @@ class FilesSampleWriter:
 class DummySampleWriter:
     """Does not write"""
 
-    def __init__(self, shard_id, output_folder, save_caption, oom_shard_count, schema, encode_format):
+    def __init__(
+        self, shard_id, output_folder, save_caption, oom_shard_count, schema, encode_format
+    ):
         pass
 
     def write(self, img_str, key, caption, meta):
