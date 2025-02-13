@@ -5,7 +5,6 @@ import io
 import json
 import logging
 import math
-import os
 import time
 import traceback
 import urllib.request
@@ -19,7 +18,6 @@ import exifread
 import fsspec
 import numpy as np
 import pyarrow as pa
-from sympy import print_gtk
 
 from src.data.data_filter.script_create_nriqa_metrics_csv import (
     IMAGE_ID_KEY,
@@ -84,29 +82,41 @@ def download_image_with_retry(
     disallowed_header_directives,
     processed_image_names: set[str],
     csv_path: Path,
+    shard_id: str,
 ):
+    shard_message = f"Shard {shard_id}:"
     for _ in range(retries + 1):
-        key, _ = row
-        if str(key) in processed_image_names:
+        key, url = row
+        image_identifier = str(url)
+        if image_identifier in processed_image_names:
+            logging.info(f"{shard_message} image {image_identifier} already processed, skipping.")
             return None
 
         key, img_stream, err = download_image(
             row, timeout, user_agent_token, disallowed_header_directives
         )
         if img_stream is not None:
-            csv_row = {IMAGE_ID_KEY: key}
+            csv_row: dict[str, Any] = {
+                IMAGE_ID_KEY: image_identifier,
+                "shard_id": shard_id,
+                "key": key,
+            }
             img_stream.seek(0)
             img_buf = np.frombuffer(img_stream.read(), np.uint8)
             try:
                 image_npy = cv2.imdecode(img_buf, cv2.IMREAD_COLOR)
             except Exception:
-                logging.info(f"Failed to decode image {key}, skipping.")
+                logging.info(
+                    f"{shard_message} failed to decode image {image_identifier}, skipping."
+                )
                 write_rows(csv_path=csv_path, rows=[csv_row])
                 return None
 
             if image_npy is None or image_npy.size < 10 * 10 * 3:
                 csv_row["saved_file"] = False
-                logging.info(f"Image {key} is None or too small, skipping.")
+                logging.info(
+                    f"{shard_message} image {image_identifier} is None or too small, skipping."
+                )
                 write_rows(csv_path=csv_path, rows=[csv_row])
                 return None
 
@@ -115,7 +125,9 @@ def download_image_with_retry(
 
             if not is_high_quality:
                 problem_str = json.dumps(metrics, default=str)
-                logging.info("Not saving image: %s, %s", key, problem_str)
+                logging.info(
+                    f"{shard_message} image {image_identifier} is low quality, skipping. {problem_str}"
+                )
                 csv_row["saved_file"] = False
                 write_rows(csv_path=csv_path, rows=[csv_row])
                 return None
@@ -288,6 +300,7 @@ class Downloader:
                     disallowed_header_directives=self.disallowed_header_directives,
                     processed_image_names=self.processed_image_names,
                     csv_path=self.csv_path,
+                    shard_id=shard_id,
                 ),
                 loader,
             ):
