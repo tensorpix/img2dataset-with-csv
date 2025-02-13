@@ -97,7 +97,13 @@ def download_image_with_retry(
             csv_row = {IMAGE_ID_KEY: key}
             img_stream.seek(0)
             img_buf = np.frombuffer(img_stream.read(), np.uint8)
-            image_npy = cv2.imdecode(img_buf, cv2.IMREAD_COLOR)
+            try:
+                image_npy = cv2.imdecode(img_buf, cv2.IMREAD_COLOR)
+            except Exception:
+                logging.info(f"Failed to decode image {key}, skipping.")
+                write_rows(csv_path=csv_path, rows=[csv_row])
+                return None
+
             if image_npy is None or image_npy.size < 10 * 10 * 3:
                 csv_row["saved_file"] = False
                 logging.info(f"Image {key} is None or too small, skipping.")
