@@ -23,7 +23,7 @@ from sympy import print_gtk
 
 from src.data.data_filter.script_create_nriqa_metrics_csv import (
     IMAGE_ID_KEY,
-    compute_metrics,
+    calc_and_filter_by_metrics,
     load_existing_results,
     write_rows,
 )
@@ -87,9 +87,8 @@ def download_image_with_retry(
 ):
     for _ in range(retries + 1):
         key, _ = row
-        if key in processed_image_names:
-            logging.info(f"Skipping {key}, already in CSV.")
-            return
+        if str(key) in processed_image_names:
+            return None
 
         key, img_stream, err = download_image(
             row, timeout, user_agent_token, disallowed_header_directives
@@ -100,17 +99,22 @@ def download_image_with_retry(
             img_buf = np.frombuffer(img_stream.read(), np.uint8)
             image_npy = cv2.imdecode(img_buf, cv2.IMREAD_COLOR)
             if image_npy is None or image_npy.size < 10 * 10 * 3:
+                csv_row["saved_file"] = False
                 logging.info(f"Image {key} is None or too small, skipping.")
                 write_rows(csv_path=csv_path, rows=[csv_row])
-                return
+                return None
 
-            metrics = compute_metrics(image_npy, 1)
+            is_high_quality, metrics = calc_and_filter_by_metrics(image_npy, image_size=None)
             csv_row.update(metrics)
 
-            if False:
-                logging.info("Not saving image: %s", key)
+            if not is_high_quality:
+                problem_str = json.dumps(metrics, default=str)
+                logging.info("Not saving image: %s, %s", key, problem_str)
+                csv_row["saved_file"] = False
                 write_rows(csv_path=csv_path, rows=[csv_row])
-                return
+                return None
+
+            csv_row["saved_file"] = True
             write_rows(csv_path=csv_path, rows=[csv_row])
 
         if img_stream is not None:
@@ -282,6 +286,7 @@ class Downloader:
                 loader,
             ):
                 if not tup:
+                    semaphore.release()
                     continue
                 key, img_stream, error_message = tup
                 try:
